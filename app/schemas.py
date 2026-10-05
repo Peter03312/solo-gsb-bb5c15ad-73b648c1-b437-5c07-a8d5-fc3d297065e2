@@ -76,6 +76,26 @@ class RefundIn(BaseModel):
     copies: int = Field(gt=0)
 
 
+class ShareVersionIn(BaseModel):
+    """作者分成变更请求：以全局唯一 change_id 提交该作品的新一版分成。
+
+    - change_id 全局唯一：同号同内容重试返回原版本，同号异内容拒绝（409）；
+    - 作者编号不得重复，比例非负且合计恰好为 100。
+    """
+
+    change_id: str = Field(min_length=1, max_length=128)
+    authors: list[AuthorIn] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _check(self):
+        ids = [a.author_id for a in self.authors]
+        if len(set(ids)) != len(ids):
+            raise ValueError("作者编号重复")
+        if sum(a.ratio for a in self.authors) != Decimal(100):
+            raise ValueError("作者分成比例合计必须为 100")
+        return self
+
+
 class CloseIn(BaseModel):
     """关账请求。request_id 可选：携带时作为幂等键，同键重试返回原报表。"""
 

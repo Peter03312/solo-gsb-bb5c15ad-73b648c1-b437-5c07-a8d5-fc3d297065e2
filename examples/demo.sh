@@ -29,14 +29,32 @@ curl -s -X POST "$BASE/sales" -H 'Content-Type: application/json' -d '{
   "net_price": 33.33
 }' | fmt
 
-echo "== 3. 退款 250 册（从最后一册起冲回：200 册 10% 档 + 50 册 8% 档）=="
+echo "== 3. 退款 250 册（从最后一册起冲回：200 册 10% 档 + 50 册 8% 档；按 S100 原销售版本 v1 分账）=="
 curl -s -X POST "$BASE/refunds" -H 'Content-Type: application/json' -d '{
   "refund_id": "RF100",
   "sale_id": "S100",
   "copies": 250
 }' | fmt
 
-echo "== 4. 关账，生成不可改报表 =="
+echo "== 3b. 合作关系变更：提交分成新版本（A2 退出、A3 加入；change_id 全局唯一）=="
+curl -s -X POST "$BASE/works/BOOK-1/share-versions" -H 'Content-Type: application/json' -d '{
+  "change_id": "CHG-2026-10",
+  "authors": [
+    {"author_id": "A1", "ratio": 70},
+    {"author_id": "A3", "ratio": 30}
+  ]
+}' | fmt
+
+echo "== 3c. 同号同内容重试（返回原版本，HTTP 200）与版本查询 =="
+curl -s -o /dev/null -w "replay http: %{http_code}\n" -X POST "$BASE/works/BOOK-1/share-versions" \
+  -H 'Content-Type: application/json' -d '{
+  "change_id": "CHG-2026-10",
+  "authors": [{"author_id": "A1", "ratio": 70}, {"author_id": "A3", "ratio": 30}]
+}'
+curl -s "$BASE/works/BOOK-1/share-versions" | fmt
+curl -s "$BASE/works/BOOK-1" | fmt
+
+echo "== 4. 关账，生成不可改报表（快照固定为入账时版本，之后不再改写）=="
 curl -s -X POST "$BASE/closes" -H 'Content-Type: application/json' -d '{
   "request_id": "CLOSE-2026-09"
 }' | fmt
@@ -57,8 +75,8 @@ curl -s "$BASE/closes" | fmt
 echo "== 7. 财务确认作者付款（针对当前最新批次，即第 2 批）=="
 LATEST_CLOSE=$(curl -s "$BASE/authors/A1/settlement" | python3 -c 'import sys,json; print(json.load(sys.stdin)["latest_close_id"])')
 echo "当前最新关账批次：$LATEST_CLOSE"
-# A1 第1批净额 = 200160（销售）- 47970（退款冲回）= 152190
-# A1 第2批净额 = 5 册×200 分(10% 档)×60% = 600；可付额 = 152190 + 600 = 152790 分
+# A1 第1批净额 = 200160（销售）- 47970（退款冲回）= 152190（均按 S100 的版本 1 分账）
+# A1 第2批净额 = 5 册×200 分(10% 档)×70%（版本 2）= 700；可付额 = 152190 + 700 = 152890 分
 curl -s -X POST "$BASE/payments" -H 'Content-Type: application/json' -d "{
   \"payment_id\": \"PAY-2026-09-A1\",
   \"author_id\": \"A1\",

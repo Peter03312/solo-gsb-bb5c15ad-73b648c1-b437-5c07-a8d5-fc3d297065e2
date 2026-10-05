@@ -37,6 +37,25 @@ CREATE TABLE IF NOT EXISTS work_authors (
     PRIMARY KEY (work_id, author_id)
 );
 
+-- 作者分成版本：作品创建时为第 1 版，之后每次分成变更追加新版本；
+-- 版本按数据库提交顺序生效，新销售使用入账时的当前版本，旧销售退款仍按原销售版本分账。
+-- work_authors 始终保存当前版本（同步覆盖），历史比例只保留在本表中。
+CREATE TABLE IF NOT EXISTS work_share_versions (
+    work_id      TEXT NOT NULL REFERENCES works(work_id),
+    version      INTEGER NOT NULL,          -- 作品内递增，从 1 开始
+    change_id    TEXT UNIQUE,               -- 第 1 版为作品创建，可为 NULL；变更版本全局唯一
+    fingerprint  TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    PRIMARY KEY (work_id, version)
+);
+CREATE TABLE IF NOT EXISTS work_share_version_authors (
+    work_id   TEXT NOT NULL REFERENCES works(work_id),
+    version   INTEGER NOT NULL,
+    author_id TEXT NOT NULL,
+    ratio     TEXT NOT NULL,
+    PRIMARY KEY (work_id, version, author_id)
+);
+
 -- 全局入账序号：销售与退款统一排队，决定累计册数与关账批次归属
 CREATE TABLE IF NOT EXISTS entries (
     entry_seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -54,6 +73,7 @@ CREATE TABLE IF NOT EXISTS sales (
     cum_before          INTEGER NOT NULL,
     cum_after           INTEGER NOT NULL,
     total_royalty_cents INTEGER NOT NULL,
+    share_version       INTEGER,            -- 入账时生效的分成版本（旧数据迁移后为 1）
     close_id            INTEGER REFERENCES closes(close_id),
     fingerprint         TEXT NOT NULL,
     created_at          TEXT NOT NULL
@@ -173,7 +193,41 @@ def get_conn() -> sqlite3.Connection:
         return _conn
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """对旧版本数据库做幂等结构迁移。
+
+    - sales 增加 share_version 列（入账时生效的分成版本），旧流水回填为 1；
+    - work_share_versions / work_share_version_authors 回填第 1 版（与 work_authors 相同）。
+    """
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(sales)")}
+    if "share_version" not in cols:
+        conn.execute("ALTER TABLE sales ADD COLUMN share_version INTEGER")
+        conn.execute("UPDATE sales SET share_version=1 WHERE share_version IS NULL")
+
+    works = conn.execute("SELECT work_id, created_at, fingerprint FROM works").fetchall()
+    for w in works:
+        exists = conn.execute(
+            "SELECT 1 FROM work_share_versions WHERE work_id=? AND version=1",
+            (w["work_id"],),
+        ).fetchone()
+        if exists is not None:
+            continue
+        conn.execute(
+            "INSERT INTO work_share_versions(work_id, version, change_id, fingerprint, created_at)"
+            " VALUES(?,?,?,?,?)",
+            (w["work_id"], 1, None, w["fingerprint"], w["created_at"]),
+        )
+        conn.execute(
+            "INSERT INTO work_share_version_authors(work_id, version, author_id, ratio)"
+            " SELECT work_id, 1, author_id, ratio FROM work_authors WHERE work_id=?",
+            (w["work_id"],),
+        )
+    conn.execute("UPDATE sales SET share_version=1 WHERE share_version IS NULL")
+
+
 def init_db() -> None:
     """初始化数据库 schema（幂等，容器启动时自动执行）。"""
     with LOCK:
-        get_conn().executescript(SCHEMA)
+        conn = get_conn()
+        conn.executescript(SCHEMA)
+        _migrate(conn)

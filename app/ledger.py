@@ -4,10 +4,18 @@
 - 销售按入账序号（entries.entry_seq，即数据库提交顺序）累计册数，跨档时分档计提；
 - 每册版税 = 每册净价 × 该档费率，四舍五入到分（ROUND_HALF_UP）；
 - 作者分账：对整笔计提金额，各作者先向下取整到分，剩余分按作者编号顺序依次补齐 1 分；
+- 作者分成可随合作关系变更为新版本（作品创建即第 1 版）：按作品编号 + 全局唯一变更编号
+  + 作者编号/比例提交；同号同内容重试返回原版本，同号异内容（含不同作品）冲突 409；
+  作者编号不得重复、比例非负且合计 100，作品不存在 404、数据不合法 422；
+- 分成版本按提交顺序生效：新销售使用**入账时刻**的当前版本（与业务时间无关）；
+  旧销售的后续退款仍从原销售末册冲回并按**原销售版本**分账；
+  并发变更与入账共用同一全局锁，先后顺序确定；
 - 退款从原销售最后一册起按原每册计提冲回，并同步冲回分账；不回退累计销量；
   同一销售的累计退款册数不得超过原册数；
 - 关账汇总上一批次之后到本次提交前的全部流水，生成逐笔明细与作者合计的快照报表，
-  报表落库后不可修改；关账后补录的旧业务流水按入账序号自然进入下一批次；
+  报表落库后不可修改；已关账快照与付款记录不随后续分成变更改写；
+  退出分成的作者仍可查询并结算既有余额，新作者可参与后续关账与结算；
+  关账后补录的旧业务流水按入账序号自然进入下一批次；
 - 同号同内容重试返回原结果，同号异内容拒绝（409）。
 
 付款结算（关账后）：
@@ -29,7 +37,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
 
 from .db import LOCK, get_conn
-from .schemas import PaymentIn, RefundIn, SaleIn, WorkIn
+from .schemas import PaymentIn, RefundIn, SaleIn, ShareVersionIn, WorkIn
 
 CENT = Decimal("0.01")
 HUNDRED = Decimal(100)
@@ -156,16 +164,68 @@ def _load_work(conn: sqlite3.Connection, work_id: str) -> dict:
     return {"row": row, "tiers": tiers, "authors": authors}
 
 
-def work_response(conn: sqlite3.Connection, work_id: str) -> dict:
+def _latest_version_no(conn: sqlite3.Connection, work_id: str) -> int:
+    r = conn.execute(
+        "SELECT MAX(version) AS v FROM work_share_versions WHERE work_id=?", (work_id,)
+    ).fetchone()
+    return r["v"] or 0
+
+
+def _load_version_authors(conn: sqlite3.Connection, work_id: str, version: int) -> list[dict]:
+    """某作品某分成版本的作者比例（按作者编号顺序）。"""
+    rows = conn.execute(
+        "SELECT author_id, ratio FROM work_share_version_authors"
+        " WHERE work_id=? AND version=?",
+        (work_id, version),
+    ).fetchall()
+    if not rows:
+        raise _not_found(f"作品 {work_id} 的分成版本 {version} 不存在")
+    authors = [{"author_id": r["author_id"], "ratio": Decimal(r["ratio"]), "ratio_str": r["ratio"]}
+               for r in rows]
+    authors.sort(key=lambda a: author_order_key(a["author_id"]))
+    return authors
+
+
+def _version_authors_payload(authors: list[dict]) -> list[dict]:
+    return [
+        {"author_id": a["author_id"], "ratio": a["ratio_str"]}
+        for a in sorted(authors, key=lambda a: author_order_key(a["author_id"]))
+    ]
+
+
+def work_response(conn: sqlite3.Connection, work_id: str, version: int | None = None) -> dict:
+    """作品详情：tiers 与分成展示指定版本（缺省为当前版本）。
+
+    同 work_id 同内容创建重试时用 version=1，保证始终返回创建时的分成结果。
+    """
     w = _load_work(conn, work_id)
+    latest = _latest_version_no(conn, work_id)
+    if version is None:
+        version = latest
+    shown = _load_version_authors(conn, work_id, version) if version else w["authors"]
     return {
         "work_id": w["row"]["work_id"],
         "title": w["row"]["title"],
         "created_at": w["row"]["created_at"],
+        "share_version": version if version is not None else latest,
         "tiers": [{"threshold": t["threshold"], "rate": t["rate_str"]} for t in w["tiers"]],
-        "authors": [
-            {"author_id": a["author_id"], "ratio": a["ratio_str"]} for a in w["authors"]
-        ],
+        "authors": _version_authors_payload(shown),
+    }
+
+
+def _share_version_response(conn: sqlite3.Connection, work_id: str, version: int) -> dict:
+    v = conn.execute(
+        "SELECT * FROM work_share_versions WHERE work_id=? AND version=?",
+        (work_id, version),
+    ).fetchone()
+    if v is None:
+        raise _not_found(f"作品 {work_id} 的分成版本 {version} 不存在")
+    return {
+        "work_id": work_id,
+        "version": v["version"],
+        "change_id": v["change_id"],
+        "authors": _version_authors_payload(_load_version_authors(conn, work_id, version)),
+        "created_at": v["created_at"],
     }
 
 
@@ -179,12 +239,14 @@ def create_work(p: WorkIn) -> tuple[dict, bool]:
         if row is not None:
             if row["fingerprint"] != fp:
                 raise _conflict(f"作品 {p.work_id} 已存在且内容不一致")
-            return work_response(conn, p.work_id), False
+            # 同号同内容重试：始终返回创建时的结果（第 1 版分成），与提交时一致
+            return work_response(conn, p.work_id, version=1), False
         conn.execute("BEGIN IMMEDIATE")
         try:
+            created_at = _utcnow()
             conn.execute(
                 "INSERT INTO works(work_id, title, fingerprint, created_at) VALUES(?,?,?,?)",
-                (p.work_id, p.title, fp, _utcnow()),
+                (p.work_id, p.title, fp, created_at),
             )
             for i, t in enumerate(p.tiers):
                 conn.execute(
@@ -195,6 +257,18 @@ def create_work(p: WorkIn) -> tuple[dict, bool]:
                 conn.execute(
                     "INSERT INTO work_authors(work_id, author_id, ratio) VALUES(?,?,?)",
                     (p.work_id, a.author_id, dec_str(a.ratio)),
+                )
+            # 作品创建即第 1 版分成；同号同内容重试始终返回创建时结果（版本 1）
+            conn.execute(
+                "INSERT INTO work_share_versions(work_id, version, change_id, fingerprint,"
+                " created_at) VALUES(?,?,?,?,?)",
+                (p.work_id, 1, None, fp, created_at),
+            )
+            for a in p.authors:
+                conn.execute(
+                    "INSERT INTO work_share_version_authors(work_id, version, author_id, ratio)"
+                    " VALUES(?,?,?,?)",
+                    (p.work_id, 1, a.author_id, dec_str(a.ratio)),
                 )
             conn.commit()
         except Exception:
@@ -232,6 +306,96 @@ def work_stats(work_id: str) -> dict:
         }
 
 
+# ------------------------------------------------------- 作者分成版本
+
+
+def _share_change_fingerprint(p: ShareVersionIn) -> str:
+    return _fingerprint(
+        {
+            "change_id": p.change_id,
+            "authors": [
+                {"author_id": a.author_id, "ratio": dec_str(a.ratio)} for a in p.authors
+            ],
+        }
+    )
+
+
+def submit_share_version(work_id: str, p: ShareVersionIn) -> tuple[dict, bool]:
+    """提交作品分成新版本。返回 (版本详情, 是否新建)。
+
+    - change_id 全局唯一：同号同内容重试返回原版本（即使其所属作品之后又有新版本）；
+    - 同 change_id 异内容（含不同作品）拒绝（409）；
+    - 作品不存在拒绝（404）；作者重复/比例非法在请求体校验阶段拒绝（422）。
+    """
+    fp = _share_change_fingerprint(p)
+    with LOCK:
+        conn = get_conn()
+        existing = conn.execute(
+            "SELECT work_id, fingerprint FROM work_share_versions WHERE change_id=?",
+            (p.change_id,),
+        ).fetchone()
+        if existing is not None:
+            if existing["fingerprint"] != fp or existing["work_id"] != work_id:
+                raise _conflict(f"分成变更编号 {p.change_id} 已存在且内容不一致")
+            v = conn.execute(
+                "SELECT version FROM work_share_versions WHERE change_id=?", (p.change_id,)
+            ).fetchone()
+            return _share_version_response(conn, existing["work_id"], v["version"]), False
+        if conn.execute("SELECT 1 FROM works WHERE work_id=?", (work_id,)).fetchone() is None:
+            raise _not_found(f"作品 {work_id} 不存在")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            version = _latest_version_no(conn, work_id) + 1
+            created_at = _utcnow()
+            conn.execute(
+                "INSERT INTO work_share_versions(work_id, version, change_id, fingerprint,"
+                " created_at) VALUES(?,?,?,?,?)",
+                (work_id, version, p.change_id, fp, created_at),
+            )
+            for a in p.authors:
+                conn.execute(
+                    "INSERT INTO work_share_version_authors(work_id, version, author_id, ratio)"
+                    " VALUES(?,?,?,?)",
+                    (work_id, version, a.author_id, dec_str(a.ratio)),
+                )
+            # work_authors 同步为当前版本（旧版本比例只保留在版本表中）
+            conn.execute("DELETE FROM work_authors WHERE work_id=?", (work_id,))
+            for a in p.authors:
+                conn.execute(
+                    "INSERT INTO work_authors(work_id, author_id, ratio) VALUES(?,?,?)",
+                    (work_id, a.author_id, dec_str(a.ratio)),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return _share_version_response(conn, work_id, version), True
+
+
+def list_share_versions(work_id: str) -> dict:
+    with LOCK:
+        conn = get_conn()
+        if conn.execute("SELECT 1 FROM works WHERE work_id=?", (work_id,)).fetchone() is None:
+            raise _not_found(f"作品 {work_id} 不存在")
+        rows = conn.execute(
+            "SELECT version FROM work_share_versions WHERE work_id=? ORDER BY version",
+            (work_id,),
+        ).fetchall()
+        return {
+            "work_id": work_id,
+            "current_version": rows[-1]["version"] if rows else 0,
+            "versions": [_share_version_response(conn, work_id, r["version"]) for r in rows],
+        }
+
+
+def get_share_version(work_id: str, version: int) -> dict:
+    with LOCK:
+        conn = get_conn()
+        if conn.execute("SELECT 1 FROM works WHERE work_id=?", (work_id,)).fetchone() is None:
+            raise _not_found(f"作品 {work_id} 不存在")
+        return _share_version_response(conn, work_id, version)
+
+
 # ---------------------------------------------------------------- 销售
 
 
@@ -265,6 +429,7 @@ def sale_response(conn: sqlite3.Connection, sale_id: str) -> dict:
         "copies": s["copies"],
         "net_price": s["net_price"],
         "entry_seq": s["entry_seq"],
+        "share_version": s["share_version"],
         "cum_before": s["cum_before"],
         "cum_after": s["cum_after"],
         "segments": [
@@ -304,6 +469,9 @@ def record_sale(p: SaleIn) -> tuple[dict, bool]:
         work = _load_work(conn, p.work_id)
         conn.execute("BEGIN IMMEDIATE")
         try:
+            # 版本按提交顺序生效：使用入账时刻的当前分成版本，与业务时间无关
+            share_version = _latest_version_no(conn, p.work_id)
+            share_authors = _load_version_authors(conn, p.work_id, share_version)
             cum_before = conn.execute(
                 "SELECT COALESCE(MAX(cum_after),0) AS c FROM sales WHERE work_id=?",
                 (p.work_id,),
@@ -316,14 +484,15 @@ def record_sale(p: SaleIn) -> tuple[dict, bool]:
                 amt = ppc * seg["copies"]
                 total += amt
                 seg_rows.append((seg["tier_idx"], seg["rate_str"], seg["copies"], ppc, amt))
-            splits = split_cents(total, work["authors"])
+            splits = split_cents(total, share_authors)
             entry_seq = conn.execute(
                 "INSERT INTO entries(kind, ref_id) VALUES('sale', ?)", (p.sale_id,)
             ).lastrowid
             conn.execute(
                 "INSERT INTO sales(sale_id, work_id, business_time, copies, net_price,"
-                " entry_seq, cum_before, cum_after, total_royalty_cents, fingerprint, created_at)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                " entry_seq, cum_before, cum_after, total_royalty_cents, share_version,"
+                " fingerprint, created_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     p.sale_id,
                     p.work_id,
@@ -334,6 +503,7 @@ def record_sale(p: SaleIn) -> tuple[dict, bool]:
                     cum_before,
                     cum_after,
                     total,
+                    share_version,
                     fp,
                     _utcnow(),
                 ),
@@ -375,7 +545,7 @@ def refund_response(conn: sqlite3.Connection, refund_id: str) -> dict:
     if r is None:
         raise _not_found(f"退款流水 {refund_id} 不存在")
     sale = conn.execute(
-        "SELECT work_id FROM sales WHERE sale_id=?", (r["sale_id"],)
+        "SELECT work_id, share_version FROM sales WHERE sale_id=?", (r["sale_id"],)
     ).fetchone()
     segs = conn.execute(
         "SELECT rs.idx, rs.sale_segment_idx, rs.copies, rs.per_copy_cents, rs.amount_cents,"
@@ -394,6 +564,7 @@ def refund_response(conn: sqlite3.Connection, refund_id: str) -> dict:
         "work_id": sale["work_id"],
         "copies": r["copies"],
         "entry_seq": r["entry_seq"],
+        "share_version": sale["share_version"],
         "segments": [
             {
                 "segment_index": g["idx"],
@@ -430,7 +601,10 @@ def record_refund(p: RefundIn) -> tuple[dict, bool]:
         sale = conn.execute("SELECT * FROM sales WHERE sale_id=?", (p.sale_id,)).fetchone()
         if sale is None:
             raise _not_found(f"原销售 {p.sale_id} 不存在")
-        work = _load_work(conn, sale["work_id"])
+        # 退款始终按原销售入账时的分成版本分账（后续分成变更不影响旧销售）
+        share_authors = _load_version_authors(
+            conn, sale["work_id"], sale["share_version"]
+        )
         conn.execute("BEGIN IMMEDIATE")
         try:
             already = conn.execute(
@@ -456,7 +630,7 @@ def record_refund(p: RefundIn) -> tuple[dict, bool]:
                     to_go -= take
             portions.reverse()  # 展示时按分段正序
             total = sum(take * seg["per_copy_cents"] for seg, take in portions)
-            splits = split_cents(total, work["authors"])
+            splits = split_cents(total, share_authors)
             entry_seq = conn.execute(
                 "INSERT INTO entries(kind, ref_id) VALUES('refund', ?)", (p.refund_id,)
             ).lastrowid
@@ -635,12 +809,17 @@ def list_closes() -> dict:
 
 
 def _author_exists(conn: sqlite3.Connection, author_id: str) -> bool:
+    # 曾出现在任意分成版本（含已退出当前版本）的作者均存在；
+    # work_authors 仅为兼容查询，正常情况下当前版本作者也在版本表中。
     return (
         conn.execute(
+            "SELECT 1 FROM work_share_version_authors WHERE author_id=? LIMIT 1",
+            (author_id,),
+        ).fetchone()
+        or conn.execute(
             "SELECT 1 FROM work_authors WHERE author_id=? LIMIT 1", (author_id,)
         ).fetchone()
-        is not None
-    )
+    ) is not None
 
 
 def _latest_close_id(conn: sqlite3.Connection) -> int | None:

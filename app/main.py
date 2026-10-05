@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 from . import ledger
 from .db import init_db
 from .ledger import ApiError
-from .schemas import CloseIn, PaymentIn, RefundIn, SaleIn, WorkIn
+from .schemas import CloseIn, PaymentIn, RefundIn, SaleIn, ShareVersionIn, WorkIn
 
 
 @asynccontextmanager
@@ -20,8 +20,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="数字出版版税结算服务",
-    version="1.1.0",
-    description="阶梯版税计提、作者分账、退款冲销、关账报表与关账后付款结算",
+    version="1.2.0",
+    description="阶梯版税计提、作者分成版本、作者分账、退款冲销、关账报表与关账后付款结算",
     lifespan=lifespan,
 )
 
@@ -33,7 +33,7 @@ async def api_error_handler(request, exc: ApiError):
 
 @app.get("/", summary="服务信息")
 def root():
-    return {"service": "数字出版版税结算服务", "version": "1.1.0", "docs": "/docs"}
+    return {"service": "数字出版版税结算服务", "version": "1.2.0", "docs": "/docs"}
 
 
 @app.get("/health", summary="健康检查")
@@ -60,6 +60,31 @@ def get_work(work_id: str):
 @app.get("/works/{work_id}/stats", summary="查询作品销量汇总")
 def get_work_stats(work_id: str):
     return ledger.work_stats(work_id)
+
+
+# ---------------------------------------------------------- 作者分成版本
+
+
+@app.post(
+    "/works/{work_id}/share-versions",
+    status_code=201,
+    summary="提交作品作者分成新版本（全局唯一 change_id 幂等）",
+)
+def create_share_version(work_id: str, payload: ShareVersionIn, response: Response):
+    body, created = ledger.submit_share_version(work_id, payload)
+    if not created:  # 同号同内容重试 → 返回原版本
+        response.status_code = 200
+    return body
+
+
+@app.get("/works/{work_id}/share-versions", summary="查询作品全部分成版本（含当前版本标记）")
+def list_share_versions(work_id: str):
+    return ledger.list_share_versions(work_id)
+
+
+@app.get("/works/{work_id}/share-versions/{version}", summary="查询作品指定分成版本")
+def get_share_version(work_id: str, version: int):
+    return ledger.get_share_version(work_id, version)
 
 
 # ---------------------------------------------------------------- 销售

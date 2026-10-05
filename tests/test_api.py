@@ -452,3 +452,210 @@ def test_payment_and_author_edge_cases(client):
     assert s["negative_balance_cents"] == 0 and s["payable_cents"] == 0
     assert s["batches"] == [] and s["payments"] == []
     assert client.get("/authors/NOBODY/settlement").status_code == 404
+
+
+# ------------------------------------------------------ 作者分成版本
+
+
+def change_shares(client, work_id, change_id, authors):
+    return client.post(
+        f"/works/{work_id}/share-versions",
+        json={"change_id": change_id, "authors": authors},
+    )
+
+
+def test_work_detail_shows_current_share_version(client):
+    make_work(client)
+    body = client.get("/works/W1").json()
+    assert body["share_version"] == 1
+    assert body["authors"] == [{"author_id": "A1", "ratio": "60"}, {"author_id": "A2", "ratio": "40"}]
+
+    r = change_shares(client, "W1", "CHG-1", [{"author_id": "A1", "ratio": 70}, {"author_id": "A2", "ratio": 30}])
+    assert r.status_code == 201 and r.json()["version"] == 2
+    body = client.get("/works/W1").json()
+    assert body["share_version"] == 2 and body["authors"][0]["ratio"] == "70"
+
+
+def test_share_version_validation_and_404(client):
+    make_work(client)
+    # 作品不存在 → 404
+    r = change_shares(client, "NOPE", "CHG-X", [{"author_id": "A1", "ratio": 100}])
+    assert r.status_code == 404
+    # 比例合计不为 100 → 422
+    r = change_shares(client, "W1", "CHG-1", [{"author_id": "A1", "ratio": 70}])
+    assert r.status_code == 422
+    # 比例为负 → 422
+    r = change_shares(client, "W1", "CHG-2", [{"author_id": "A1", "ratio": -1}, {"author_id": "A2", "ratio": 101}])
+    assert r.status_code == 422
+    # 作者编号重复 → 422
+    r = change_shares(client, "W1", "CHG-3", [{"author_id": "A1", "ratio": 50}, {"author_id": "A1", "ratio": 50}])
+    assert r.status_code == 422
+
+
+def test_share_change_idempotent_replay_and_conflict(client):
+    make_work(client)
+    new_authors = [{"author_id": "A1", "ratio": 70}, {"author_id": "A2", "ratio": 30}]
+    r1 = change_shares(client, "W1", "CHG-1", new_authors)
+    assert r1.status_code == 201
+    # 同号同内容重试 → 原版本（200）
+    r2 = change_shares(client, "W1", "CHG-1", new_authors)
+    assert r2.status_code == 200 and r2.json() == r1.json()
+    # 之后又提交了第 3 版，原 change_id 重试仍返回第 2 版
+    change_shares(client, "W1", "CHG-2", [{"author_id": "A1", "ratio": 100}])
+    r3 = change_shares(client, "W1", "CHG-1", new_authors)
+    assert r3.status_code == 200 and r3.json()["version"] == 2
+    # 同号异内容 → 409
+    r4 = change_shares(client, "W1", "CHG-1", [{"author_id": "A1", "ratio": 80}, {"author_id": "A2", "ratio": 20}])
+    assert r4.status_code == 409
+    # 同号用于其他作品 → 409
+    make_work(client, work_id="W2")
+    assert change_shares(client, "W2", "CHG-1", new_authors).status_code == 409
+
+
+def test_share_version_list_and_get(client):
+    make_work(client)
+    change_shares(client, "W1", "CHG-1", [{"author_id": "A1", "ratio": 70}, {"author_id": "A2", "ratio": 30}])
+    change_shares(client, "W1", "CHG-2", [
+        {"author_id": "A1", "ratio": 50}, {"author_id": "A2", "ratio": 20}, {"author_id": "A3", "ratio": 30},
+    ])
+    body = client.get("/works/W1/share-versions").json()
+    assert body["current_version"] == 3
+    assert [v["version"] for v in body["versions"]] == [1, 2, 3]
+    assert body["versions"][0]["change_id"] is None
+    assert body["versions"][2]["authors"] == [
+        {"author_id": "A1", "ratio": "50"},
+        {"author_id": "A2", "ratio": "20"},
+        {"author_id": "A3", "ratio": "30"},
+    ]
+    assert client.get("/works/W1/share-versions/2").json()["change_id"] == "CHG-1"
+    assert client.get("/works/W1/share-versions/9").status_code == 404
+    assert client.get("/works/NOPE/share-versions").status_code == 404
+
+
+def test_sales_use_version_at_entry_time_not_business_time(client):
+    make_work(client)
+    # 变更为 A1 70 / A2 30（版本 2）
+    change_shares(client, "W1", "CHG-1", [{"author_id": "A1", "ratio": 70}, {"author_id": "A2", "ratio": 30}])
+
+    # 入账时刻为版本 2：即使业务时间早于变更，仍按版本 2 分账
+    r = make_sale(client, "S-OLD", copies=100, price="10.00", ts="2020-01-01T00:00:00")
+    assert r.status_code == 201
+    body = r.json()
+    assert body["share_version"] == 2  # 100 册×10 元×8% = 8000
+    assert body["splits"] == [{"author_id": "A1", "amount_cents": 5600},
+                              {"author_id": "A2", "amount_cents": 2400}]
+
+    # 变更为 A1 50 / 新作者 A3 50（版本 3）；A2 退出当前分成
+    change_shares(client, "W1", "CHG-2", [{"author_id": "A1", "ratio": 50}, {"author_id": "A3", "ratio": 50}])
+    r = make_sale(client, "S-NEW", copies=100, price="10.00")
+    body = r.json()
+    assert body["share_version"] == 3
+    assert body["splits"] == [{"author_id": "A1", "amount_cents": 4000},
+                              {"author_id": "A3", "amount_cents": 4000}]
+
+
+def test_refund_after_share_change_uses_original_sale_version(client):
+    make_work(client)
+    make_sale(client, "S1", copies=100, price="10.00")  # 版本 1：A1 60 / A2 40 → 4800/3200
+
+    # 之后分成变更（A2 退出，A3 加入），旧销售退款仍按版本 1 从末册冲回并分账
+    change_shares(client, "W1", "CHG-1", [{"author_id": "A1", "ratio": 50}, {"author_id": "A3", "ratio": 50}])
+    r = client.post("/refunds", json={"refund_id": "R1", "sale_id": "S1", "copies": 50})
+    assert r.status_code == 201
+    body = r.json()
+    assert body["share_version"] == 1
+    assert body["total_refund_cents"] == 4000  # 50 册×80 分
+    assert body["splits"] == [{"author_id": "A1", "amount_cents": 2400},
+                              {"author_id": "A2", "amount_cents": 1600}]
+
+    # 同号退款重试 → 原结果（仍为版本 1 分账）
+    r2 = client.post("/refunds", json={"refund_id": "R1", "sale_id": "S1", "copies": 50})
+    assert r2.status_code == 200 and r2.json() == body
+
+
+def test_closed_snapshots_and_payments_not_rewritten_by_later_change(client):
+    make_work(client)
+    make_sale(client, "S1", copies=100, price="10.00")  # A1 4800 / A2 3200
+    c1 = client.post("/closes", json={"request_id": "C1"}).json()["close_id"]
+    assert pay(client, "P1", "A1", c1, 4800).status_code == 201
+
+    # 关账与付款之后变更分成（A2 退出，A3 加入）
+    change_shares(client, "W1", "CHG-1", [{"author_id": "A1", "ratio": 50}, {"author_id": "A3", "ratio": 50}])
+    # 旧快照不改写：批次 1 仍是 A1 4800 / A2 3200，行内销售仍标记版本 1
+    report = client.get(f"/closes/{c1}").json()
+    assert report["author_totals"] == [
+        {"author_id": "A1", "amount_cents": 4800},
+        {"author_id": "A2", "amount_cents": 3200},
+    ]
+    assert report["lines"][0]["share_version"] == 1
+    # 旧付款不改写，同号重放返回原结算
+    old = client.get("/payments/P1").json()
+    assert old["accrued_cents"] == 4800
+    assert pay(client, "P1", "A1", c1, 4800).json() == old
+
+    # 退出分成的 A2 仍可查询并结算既有余额；新作者 A3 在后续批次中参与
+    make_sale(client, "S2", copies=100, price="10.00")  # 版本 3：A1/A3 各 4000
+    # 旧销售的退款仍记给 A2
+    client.post("/refunds", json={"refund_id": "R1", "sale_id": "S1", "copies": 100})
+    c2 = client.post("/closes", json={"request_id": "C2"}).json()["close_id"]
+
+    s2 = client.get("/authors/A2/settlement").json()
+    assert s2["accrued_cents"] == 0 and s2["paid_cents"] == 0  # 3200 - 3200
+    assert [b["batch_net_cents"] for b in s2["batches"]] == [3200, -3200]
+
+    s3 = client.get("/authors/A3/settlement").json()
+    assert s3["accrued_cents"] == 4000 and s3["payable_cents"] == 4000
+    assert pay(client, "P2", "A3", c2, 4000).status_code == 201
+
+
+def test_create_work_replay_returns_creation_result_after_change(client):
+    assert make_work(client).status_code == 201
+    change_shares(client, "W1", "CHG-1", [{"author_id": "A1", "ratio": 100}])
+    # 原 work_id 同内容创建重试仍返回创建时结果：第 1 版 60/40
+    r = make_work(client)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["share_version"] == 1
+    assert body["authors"] == [{"author_id": "A1", "ratio": "60"}, {"author_id": "A2", "ratio": "40"}]
+    # GET 详情仍展示当前版本
+    assert client.get("/works/W1").json()["authors"] == [{"author_id": "A1", "ratio": "100"}]
+
+
+def test_concurrent_share_changes_and_sales_have_determined_order(client):
+    make_work(client)
+
+    def change(i):
+        return change_shares(client, "W1", f"CHG-{i}", [
+            {"author_id": f"A{i % 3}", "ratio": 100}
+        ])
+
+    def sale(i):
+        return make_sale(client, f"CC{i}", copies=1, price="10.00")
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        f_changes = [pool.submit(change, i) for i in range(1, 21)]
+        f_sales = [pool.submit(sale, i) for i in range(20)]
+        change_results = [f.result() for f in f_changes]
+        sale_results = [f.result() for f in f_sales]
+
+    assert [r.status_code for r in change_results] == [201] * 20
+    assert all(r.status_code == 201 for r in sale_results)
+    # 版本号 2..21 无丢无重；每笔销售恰好落在提交时刻的当前版本
+    versions = sorted(r.json()["version"] for r in change_results)
+    assert versions == list(range(2, 22))
+    used = [client.get(f"/sales/CC{i}").json()["share_version"] for i in range(20)]
+    assert all(1 <= v <= 21 for v in used)
+    # 分账作者必须是该笔销售版本中的唯一 100% 作者
+    for i in range(20):
+        body = client.get(f"/sales/CC{i}").json()
+        v = body["share_version"]
+        expected = None
+        if v == 1:
+            # 版本 1 为 A1 60 / A2 40：80 分总额按既有规则补齐
+            assert sum(x["amount_cents"] for x in body["splits"]) == 80
+        else:
+            chg = client.get(f"/works/W1/share-versions/{v}").json()
+            expected = chg["authors"][0]["author_id"]
+            assert len(chg["authors"]) == 1
+            assert body["splits"] == [{"author_id": expected, "amount_cents": 80}]
+
