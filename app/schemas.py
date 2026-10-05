@@ -57,6 +57,26 @@ class WorkIn(BaseModel):
         return self
 
 
+class SplitChangeIn(BaseModel):
+    """作者分成变更：为作品提交一个新分成版本（版本按提交顺序生效）。
+
+    - change_id 全局唯一：同号同内容重试返回原版本，同号异内容拒绝（409）；
+    - 作者编号不得重复，比例非负且合计必须为 100。
+    """
+
+    change_id: str = Field(min_length=1, max_length=128)
+    authors: list[AuthorIn] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _check(self):
+        ids = [a.author_id for a in self.authors]
+        if len(set(ids)) != len(ids):
+            raise ValueError("作者编号重复")
+        if sum(a.ratio for a in self.authors) != Decimal(100):
+            raise ValueError("作者分成比例合计必须为 100")
+        return self
+
+
 class SaleIn(BaseModel):
     sale_id: str = Field(min_length=1, max_length=128)
     work_id: str = Field(min_length=1, max_length=128)

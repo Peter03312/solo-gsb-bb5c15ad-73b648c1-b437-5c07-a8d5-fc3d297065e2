@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 端到端调用示例：录入作品 → 销售 → 退款 → 关账 → 查看报表
+# 端到端调用示例：录入作品 → 销售 → 退款 → 关账 → 查看报表 → 付款结算
+#              → 作者分成版本变更 → 新版本销售/旧销售退款 → 退出作者结算
 # 用法：BASE_URL=http://localhost:8000 ./examples/demo.sh
 set -euo pipefail
 
@@ -77,3 +78,40 @@ curl -s -X POST "$BASE/payments" -H 'Content-Type: application/json' -d "{
 echo "== 9. 按作者查询：分批应计/已付/负余额/可付额/付款记录 =="
 curl -s "$BASE/authors/A1/settlement" | fmt
 curl -s "$BASE/payments/PAY-2026-09-A1" | fmt
+
+echo "== 10. 合作关系变化：提交作者分成新版本（A2 退出、A3 加入；变更编号全局唯一）=="
+curl -s -X POST "$BASE/works/BOOK-1/splits" -H 'Content-Type: application/json' -d '{
+  "change_id": "CHG-2026-10-01",
+  "authors": [
+    {"author_id": "A1", "ratio": 70},
+    {"author_id": "A3", "ratio": 30}
+  ]
+}' | fmt
+
+echo "== 11. 查询当前及历次分成版本；作品详情展示当前分成 =="
+curl -s "$BASE/works/BOOK-1/splits" | fmt
+curl -s "$BASE/works/BOOK-1/splits/1" | fmt
+curl -s "$BASE/works/BOOK-1" | fmt
+
+echo "== 12. 新销售按入账时的分成版本（v2：A1 70 / A3 30）分账 =="
+curl -s -X POST "$BASE/sales" -H 'Content-Type: application/json' -d '{
+  "sale_id": "S102",
+  "work_id": "BOOK-1",
+  "business_time": "2026-10-01T09:00:00",
+  "copies": 10,
+  "net_price": 20.00
+}' | fmt
+
+echo "== 13. 旧销售 S100 的退款仍从末册冲回，并按原销售版本（v1：A1 60 / A2 40）分账 =="
+curl -s -X POST "$BASE/refunds" -H 'Content-Type: application/json' -d '{
+  "refund_id": "RF101",
+  "sale_id": "S100",
+  "copies": 10
+}' | fmt
+
+echo "== 14. 再次关账：退出作者 A2 仍可查询并结算既有余额，新作者 A3 参与关账与结算 =="
+curl -s -X POST "$BASE/closes" -H 'Content-Type: application/json' -d '{
+  "request_id": "CLOSE-2026-10"
+}' | fmt
+curl -s "$BASE/authors/A2/settlement" | fmt
+curl -s "$BASE/authors/A3/settlement" | fmt

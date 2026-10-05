@@ -1,6 +1,7 @@
 """端到端 API 测试：阶梯计提、分账舍入、退款冲销、关账批次、幂等与并发。"""
 from __future__ import annotations
 
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -452,3 +453,293 @@ def test_payment_and_author_edge_cases(client):
     assert s["negative_balance_cents"] == 0 and s["payable_cents"] == 0
     assert s["batches"] == [] and s["payments"] == []
     assert client.get("/authors/NOBODY/settlement").status_code == 404
+
+
+# ---------------------------------------------------------------- 作者分成版本
+
+
+def change_split(client, work_id, change_id, authors):
+    return client.post(
+        f"/works/{work_id}/splits",
+        json={"change_id": change_id, "authors": authors},
+    )
+
+
+def test_split_change_validation(client):
+    make_work(client)
+    # 作品不存在 → 404
+    assert change_split(client, "NOPE", "X1", [{"author_id": "A1", "ratio": 100}]).status_code == 404
+    # 作者编号重复 → 422
+    assert change_split(
+        client, "W1", "X2",
+        [{"author_id": "A1", "ratio": 50}, {"author_id": "A1", "ratio": 50}],
+    ).status_code == 422
+    # 合计不为 100 → 422
+    assert change_split(client, "W1", "X3", [{"author_id": "A1", "ratio": 60}]).status_code == 422
+    # 比例为负（或超过 100）→ 422
+    assert change_split(
+        client, "W1", "X4",
+        [{"author_id": "A1", "ratio": 120}, {"author_id": "A2", "ratio": -20}],
+    ).status_code == 422
+    # 空作者列表 → 422
+    assert change_split(client, "W1", "X5", []).status_code == 422
+    # 校验失败的提交不占用变更编号：修正后可用同号提交
+    r = change_split(client, "W1", "X3", [{"author_id": "A1", "ratio": 100}])
+    assert r.status_code == 201 and r.json()["version"] == 2
+
+
+def test_split_change_idempotency_and_global_conflict(client):
+    make_work(client)
+    make_work(client, work_id="W2", authors=[{"author_id": "B1", "ratio": 100}])
+    payload = [{"author_id": "A1", "ratio": 100}]
+    r1 = change_split(client, "W1", "CHG-1", payload)
+    assert r1.status_code == 201
+    assert r1.json()["version"] == 2 and r1.json()["change_id"] == "CHG-1"
+    # 同号同内容重试 → 返回原版本（作者顺序不同视为同内容）
+    r2 = change_split(client, "W1", "CHG-1", payload)
+    assert r2.status_code == 200 and r2.json() == r1.json()
+    # 同号异内容 → 409
+    assert change_split(client, "W1", "CHG-1", [{"author_id": "A2", "ratio": 100}]).status_code == 409
+    # 变更编号全局唯一：同一编号用于另一作品 → 409
+    assert change_split(client, "W2", "CHG-1", payload).status_code == 409
+
+
+def test_split_versions_listing_and_detail(client):
+    make_work(client)
+    change_split(client, "W1", "CHG-1",
+                 [{"author_id": "A1", "ratio": 70}, {"author_id": "A2", "ratio": 30}])
+    change_split(client, "W1", "CHG-2", [{"author_id": "A9", "ratio": 100}])
+
+    r = client.get("/works/W1/splits")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["current_version"] == 3
+    assert [v["version"] for v in body["versions"]] == [1, 2, 3]
+    # 版本 1 为创建时的初始分成，无变更编号
+    assert body["versions"][0]["change_id"] is None
+    assert body["versions"][0]["authors"] == [
+        {"author_id": "A1", "ratio": "60"},
+        {"author_id": "A2", "ratio": "40"},
+    ]
+    assert body["versions"][1]["change_id"] == "CHG-1"
+
+    # 指定版本查询
+    v2 = client.get("/works/W1/splits/2").json()
+    assert v2["authors"] == [
+        {"author_id": "A1", "ratio": "70"},
+        {"author_id": "A2", "ratio": "30"},
+    ]
+    assert client.get("/works/W1/splits/99").status_code == 404
+    assert client.get("/works/NOPE/splits").status_code == 404
+    assert client.get("/works/NOPE/splits/1").status_code == 404
+
+
+def test_work_detail_shows_current_split_and_create_replay_returns_original(client):
+    assert make_work(client).status_code == 201
+    change_split(client, "W1", "CHG-1", [{"author_id": "A1", "ratio": 100}])
+
+    # 作品详情展示当前分成
+    w = client.get("/works/W1").json()
+    assert w["split_version"] == 2
+    assert w["authors"] == [{"author_id": "A1", "ratio": "100"}]
+
+    # 原作品编号同内容创建重试仍返回创建时结果（初始分成）
+    r = make_work(client)
+    assert r.status_code == 200
+    assert r.json()["split_version"] == 1
+    assert r.json()["authors"] == [
+        {"author_id": "A1", "ratio": "60"},
+        {"author_id": "A2", "ratio": "40"},
+    ]
+    # 同号异内容仍是 409
+    assert make_work(client, authors=[{"author_id": "A1", "ratio": 100}]).status_code == 409
+
+
+def test_sales_use_split_version_at_entry(client):
+    make_work(client)
+    s1 = make_sale(client, "S1", copies=10, price="10.00").json()
+    assert s1["split_version"] == 1
+    assert s1["splits"] == [
+        {"author_id": "A1", "amount_cents": 480},
+        {"author_id": "A2", "amount_cents": 320},
+    ]
+
+    change_split(client, "W1", "CHG-1",
+                 [{"author_id": "A2", "ratio": 25}, {"author_id": "A1", "ratio": 75}])
+    s2 = make_sale(client, "S2", copies=10, price="10.00").json()
+    assert s2["split_version"] == 2
+    assert s2["splits"] == [
+        {"author_id": "A1", "amount_cents": 600},
+        {"author_id": "A2", "amount_cents": 200},
+    ]
+
+    # 业务时间不决定版本：业务时间更早的销售仍按入账时版本
+    s3 = make_sale(client, "S3", copies=10, price="10.00", ts="2020-01-01T00:00:00").json()
+    assert s3["split_version"] == 2
+
+    # 既有销售重试仍返回原结果（含原版本号）
+    r = make_sale(client, "S1", copies=10, price="10.00")
+    assert r.status_code == 200 and r.json() == s1
+
+
+def test_refund_uses_original_sale_split_version(client):
+    make_work(client)  # v1: A1 60 / A2 40
+    make_sale(client, "S1", copies=100)  # 26700 → A1 16020 / A2 10680
+    # 变更：A1 退出，A3 新加入
+    r = change_split(client, "W1", "CHG-1",
+                     [{"author_id": "A2", "ratio": 50}, {"author_id": "A3", "ratio": 50}])
+    assert r.status_code == 201 and r.json()["version"] == 2
+
+    # 新销售按新版本分账
+    body = make_sale(client, "S2", copies=100).json()
+    assert body["split_version"] == 2
+    assert body["splits"] == [
+        {"author_id": "A2", "amount_cents": 13350},
+        {"author_id": "A3", "amount_cents": 13350},
+    ]
+
+    # 旧销售的后续退款仍从末册冲回并按原销售版本（v1）分账
+    r = client.post("/refunds", json={"refund_id": "R1", "sale_id": "S1", "copies": 10})
+    assert r.status_code == 201
+    body = r.json()
+    assert body["split_version"] == 1
+    assert body["total_refund_cents"] == 2670
+    assert body["splits"] == [
+        {"author_id": "A1", "amount_cents": 1602},
+        {"author_id": "A2", "amount_cents": 1068},
+    ]
+    # 新销售的退款按新版本（v2）分账
+    r = client.post("/refunds", json={"refund_id": "R2", "sale_id": "S2", "copies": 10})
+    assert r.json()["split_version"] == 2
+    assert r.json()["splits"] == [
+        {"author_id": "A2", "amount_cents": 1335},
+        {"author_id": "A3", "amount_cents": 1335},
+    ]
+    # 既有退款重试仍返回原结果
+    r = client.post("/refunds", json={"refund_id": "R1", "sale_id": "S1", "copies": 10})
+    assert r.status_code == 200 and r.json() == body
+
+
+def test_exited_author_keeps_settlement_and_new_author_settles(client):
+    make_work(client)  # v1: A1 60 / A2 40
+    make_sale(client, "S1", copies=100)  # 26700 → A1 16020 / A2 10680
+    client.post("/closes", json={"request_id": "C1"})
+
+    # A2 退出，A3 加入
+    change_split(client, "W1", "CHG-1",
+                 [{"author_id": "A1", "ratio": 70}, {"author_id": "A3", "ratio": 30}])
+    make_sale(client, "S2", copies=100)  # 26700 → A1 18690 / A3 8010
+    c2 = client.post("/closes", json={"request_id": "C2"}).json()["close_id"]
+
+    # 退出分成的作者仍可查询并结算既有余额
+    s = client.get("/authors/A2/settlement").json()
+    assert s["accrued_cents"] == 10680 and s["payable_cents"] == 10680
+    assert pay(client, "P-A2", "A2", c2, 10680).status_code == 201
+    assert client.get("/authors/A2/settlement").json()["payable_cents"] == 0
+
+    # 新作者参与后续关账与结算
+    s = client.get("/authors/A3/settlement").json()
+    assert [(b["close_id"], b["batch_net_cents"]) for b in s["batches"]] == [
+        (1, 0),
+        (c2, 8010),
+    ]
+    assert s["accrued_cents"] == 8010
+    assert pay(client, "P-A3", "A3", c2, 8010).status_code == 201
+
+    # A1 跨版本累计应计
+    s = client.get("/authors/A1/settlement").json()
+    assert s["accrued_cents"] == 16020 + 18690
+
+    # 已关账快照与付款记录不改写
+    c1_report = client.get("/closes/1").json()
+    assert c1_report["author_totals"] == [
+        {"author_id": "A1", "amount_cents": 16020},
+        {"author_id": "A2", "amount_cents": 10680},
+    ]
+
+
+def test_concurrent_split_changes_and_sales(client):
+    make_work(client)
+
+    def change(i):
+        return change_split(client, "W1", f"CHG-{i}", [{"author_id": "A1", "ratio": 100}])
+
+    def sale(i):
+        return make_sale(client, f"VS{i}", copies=1, price="10.00")
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(change, i) for i in range(5)]
+        futures += [pool.submit(sale, i) for i in range(20)]
+        results = [f.result() for f in futures]
+    assert all(r.status_code == 201 for r in results)
+
+    # 版本号按提交顺序连续递增，无重号无缺口
+    versions = client.get("/works/W1/splits").json()
+    assert [v["version"] for v in versions["versions"]] == [1, 2, 3, 4, 5, 6]
+    assert versions["current_version"] == 6
+
+    # 并发变更与入账有确定先后：入账序号单调 ⇒ 使用的分成版本单调不减
+    sales_are = [client.get(f"/sales/VS{i}").json() for i in range(20)]
+    by_seq = sorted(sales_are, key=lambda s: s["entry_seq"])
+    used = [s["split_version"] for s in by_seq]
+    assert used == sorted(used)
+    assert all(1 <= v <= 6 for v in used)
+
+
+LEGACY_SCHEMA = """
+CREATE TABLE works (work_id TEXT PRIMARY KEY, title TEXT, fingerprint TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE work_tiers (work_id TEXT NOT NULL, idx INTEGER NOT NULL, threshold INTEGER NOT NULL, rate TEXT NOT NULL, PRIMARY KEY (work_id, idx));
+CREATE TABLE work_authors (work_id TEXT NOT NULL, author_id TEXT NOT NULL, ratio TEXT NOT NULL, PRIMARY KEY (work_id, author_id));
+CREATE TABLE entries (entry_seq INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL CHECK (kind IN ('sale','refund')), ref_id TEXT NOT NULL);
+CREATE TABLE sales (sale_id TEXT PRIMARY KEY, work_id TEXT NOT NULL, business_time TEXT NOT NULL, copies INTEGER NOT NULL, net_price TEXT NOT NULL, entry_seq INTEGER NOT NULL UNIQUE, cum_before INTEGER NOT NULL, cum_after INTEGER NOT NULL, total_royalty_cents INTEGER NOT NULL, close_id INTEGER, fingerprint TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE sale_segments (sale_id TEXT NOT NULL, idx INTEGER NOT NULL, tier_idx INTEGER NOT NULL, rate TEXT NOT NULL, copies INTEGER NOT NULL, per_copy_cents INTEGER NOT NULL, amount_cents INTEGER NOT NULL, refunded_copies INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (sale_id, idx));
+CREATE TABLE sale_splits (sale_id TEXT NOT NULL, author_id TEXT NOT NULL, amount_cents INTEGER NOT NULL, PRIMARY KEY (sale_id, author_id));
+"""
+
+
+def test_migration_from_legacy_schema(tmp_path):
+    """旧库（无分成版本）启动自动迁移：初始分成迁为版本 1，历史销售记为版本 1。"""
+    path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(str(path))
+    conn.executescript(LEGACY_SCHEMA)
+    conn.execute("INSERT INTO works VALUES('W1','旧作品','fp','2026-01-01T00:00:00+00:00')")
+    conn.execute("INSERT INTO work_tiers VALUES('W1',0,0,'0.08')")
+    conn.execute("INSERT INTO work_authors VALUES('W1','A1','60')")
+    conn.execute("INSERT INTO work_authors VALUES('W1','A2','40')")
+    conn.execute("INSERT INTO entries(kind, ref_id) VALUES('sale','S1')")
+    conn.execute(
+        "INSERT INTO sales(sale_id, work_id, business_time, copies, net_price, entry_seq,"
+        " cum_before, cum_after, total_royalty_cents, close_id, fingerprint, created_at)"
+        " VALUES('S1','W1','2026-01-01T00:00:00',100,'33.33',1,0,100,26700,NULL,'fp',"
+        " '2026-01-01T00:00:00+00:00')"
+    )
+    conn.execute("INSERT INTO sale_segments VALUES('S1',0,0,'0.08',100,267,26700,0)")
+    conn.execute("INSERT INTO sale_splits VALUES('S1','A1',16020)")
+    conn.execute("INSERT INTO sale_splits VALUES('S1','A2',10680)")
+    conn.commit()
+    conn.close()
+
+    db.open_database(str(path))
+    db.init_db()
+    with TestClient(main.app) as client:
+        # 旧作品分成迁为版本 1，详情可查
+        w = client.get("/works/W1").json()
+        assert w["split_version"] == 1
+        assert w["authors"] == [
+            {"author_id": "A1", "ratio": "60"},
+            {"author_id": "A2", "ratio": "40"},
+        ]
+        # 历史销售记为版本 1；其退款仍按原版本分账
+        assert client.get("/sales/S1").json()["split_version"] == 1
+        r = client.post("/refunds", json={"refund_id": "R1", "sale_id": "S1", "copies": 10})
+        assert r.status_code == 201
+        assert r.json()["split_version"] == 1
+        assert r.json()["splits"] == [
+            {"author_id": "A1", "amount_cents": 1602},
+            {"author_id": "A2", "amount_cents": 1068},
+        ]
+        # 迁移后可正常变更分成，新销售使用新版本
+        assert change_split(client, "W1", "CHG-1", [{"author_id": "A1", "ratio": 100}]).status_code == 201
+        s = make_sale(client, "S2", copies=1, price="10.00").json()
+        assert s["split_version"] == 2
+        assert s["splits"] == [{"author_id": "A1", "amount_cents": 80}]

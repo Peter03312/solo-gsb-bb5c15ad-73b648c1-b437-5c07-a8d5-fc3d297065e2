@@ -30,11 +30,23 @@ CREATE TABLE IF NOT EXISTS work_tiers (
     rate      TEXT NOT NULL,
     PRIMARY KEY (work_id, idx)
 );
-CREATE TABLE IF NOT EXISTS work_authors (
-    work_id   TEXT NOT NULL REFERENCES works(work_id),
+-- 作者分成版本：创建作品时的初始分成为版本 1（change_id 为 NULL）；
+-- 之后每次变更追加一个版本，change_id 全局唯一，版本号按提交顺序递增
+CREATE TABLE IF NOT EXISTS work_versions (
+    work_id     TEXT NOT NULL REFERENCES works(work_id),
+    version     INTEGER NOT NULL,
+    change_id   TEXT UNIQUE,
+    fingerprint TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (work_id, version)
+);
+CREATE TABLE IF NOT EXISTS work_version_authors (
+    work_id   TEXT NOT NULL,
+    version   INTEGER NOT NULL,
     author_id TEXT NOT NULL,
     ratio     TEXT NOT NULL,
-    PRIMARY KEY (work_id, author_id)
+    PRIMARY KEY (work_id, version, author_id),
+    FOREIGN KEY (work_id, version) REFERENCES work_versions(work_id, version)
 );
 
 -- 全局入账序号：销售与退款统一排队，决定累计册数与关账批次归属
@@ -53,6 +65,7 @@ CREATE TABLE IF NOT EXISTS sales (
     entry_seq           INTEGER NOT NULL UNIQUE REFERENCES entries(entry_seq),
     cum_before          INTEGER NOT NULL,
     cum_after           INTEGER NOT NULL,
+    split_version       INTEGER NOT NULL DEFAULT 1,  -- 入账时使用的作者分成版本
     total_royalty_cents INTEGER NOT NULL,
     close_id            INTEGER REFERENCES closes(close_id),
     fingerprint         TEXT NOT NULL,
@@ -176,4 +189,35 @@ def get_conn() -> sqlite3.Connection:
 def init_db() -> None:
     """初始化数据库 schema（幂等，容器启动时自动执行）。"""
     with LOCK:
-        get_conn().executescript(SCHEMA)
+        conn = get_conn()
+        conn.executescript(SCHEMA)
+        _migrate(conn)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """旧库迁移（幂等）：为 sales 补 split_version 列；把旧 work_authors 表迁为版本 1。"""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(sales)")}
+    if "split_version" not in cols:
+        # 版本机制之前的销售均按初始分成计提，回填版本 1
+        conn.execute(
+            "ALTER TABLE sales ADD COLUMN split_version INTEGER NOT NULL DEFAULT 1"
+        )
+    has_legacy = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='work_authors'"
+    ).fetchone()
+    if has_legacy:
+        works = conn.execute(
+            "SELECT w.work_id, w.fingerprint, w.created_at FROM works w"
+            " WHERE NOT EXISTS(SELECT 1 FROM work_versions v WHERE v.work_id=w.work_id)"
+        ).fetchall()
+        for w in works:
+            conn.execute(
+                "INSERT INTO work_versions(work_id, version, change_id, fingerprint,"
+                " created_at) VALUES(?,1,NULL,?,?)",
+                (w["work_id"], w["fingerprint"], w["created_at"]),
+            )
+            conn.execute(
+                "INSERT INTO work_version_authors(work_id, version, author_id, ratio)"
+                " SELECT work_id, 1, author_id, ratio FROM work_authors WHERE work_id=?",
+                (w["work_id"],),
+            )
